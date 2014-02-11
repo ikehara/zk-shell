@@ -5,6 +5,7 @@
 module Main where
 
 -- import Control.Exception
+import Data.Maybe
 import Data.List.Split
 import Control.Concurrent.STM
 import System.Console.Haskeline
@@ -16,6 +17,9 @@ import qualified Database.Zookeeper as Z
 import System.IO
 import Control.Monad
 import Text.Printf
+import System.IO.Temp
+import System.Directory (removeFile)
+import System.Process (createProcess, waitForProcess, proc)
 
 data Shell = Shell {
     sZookeeper :: Z.Zookeeper
@@ -46,6 +50,9 @@ data Options =
   | Rm {
        path :: String
      , recursive :: Bool
+     }
+  | Edit {
+       path :: String
      }
   | Stat {
      }
@@ -96,6 +103,13 @@ rm = Rm {
                 , "rm /foo/bar"
                 ]
 
+edit :: Options
+edit = Edit {
+    path = def &= typ "PATH" &= argPos 0
+  } &= details  [ "Examples:"
+                , "edit /foo/bar"
+                ]
+ 
 stat :: Options
 stat = Stat {
   } &= details  [ "Examples:"
@@ -103,7 +117,7 @@ stat = Stat {
                 ]
 
 commandModes :: Mode (CmdArgs Options)
-commandModes = cmdArgsMode $ modes [ls, get, set, create, touch, rm, stat]
+commandModes = cmdArgsMode $ modes [ls, get, set, create, touch, rm, edit, stat]
   &= verbosityArgs [explicit, name "Verbose", name "V"] []
   &= versionArg [explicit, name "version", name "v", summary _PROGRAM_INFO]
   &= summary (_PROGRAM_INFO ++ ", " ++ _COPYRIGHT)
@@ -181,8 +195,10 @@ exec Shell { sZookeeper = z } opts@Ls {} = do
 exec Shell { sZookeeper = z } opts@Get {} = do
   e <- Z.get z (path opts) Nothing
   case e of
-    Right (mData, stat) -> print mData
-    Left Z.NoNodeError -> return ()
+    Right (mContent, stat) -> case mContent of
+      Just content -> do
+        BS.putStrLn content
+      Nothing -> return ()
     Left zkerr -> hPutStrLn stderr $ show zkerr
 
 exec Shell { sZookeeper = z } opts@Set {} = do
@@ -222,6 +238,38 @@ exec c@Shell { sZookeeper = z } opts@Rm {} = case recursive opts of
     case e of
       Right stat -> return ()
       Left zkerr -> hPutStrLn stderr $ show zkerr
+
+exec c@Shell { sZookeeper = z } opts@Edit {} = do
+  let p = path opts
+  e <- Z.get z p Nothing
+  case e of
+    Right (mData, stat) -> do
+      (tempFilePath, hTempFile) <- openTempFile "./" (".zk.")
+      let content = fromMaybe (BS.empty) mData
+      BS.hPutStr hTempFile content
+      hClose hTempFile
+      editor <- fmap (fromMaybe "vi") $ lookupEnv "EDITOR" -- TODO vim -b "+set noeol"
+      (_, _, _, hEditor) <- createProcess (proc editor [tempFilePath])
+      waitForProcess hEditor
+      content' <- fmap BS.pack $ readFile tempFilePath
+      removeFile tempFilePath
+      if content /= content'
+        then do
+          hPutStr stdout "updating (y/n)? "
+          hFlush stdout
+          confirm <- getLine
+          case confirm of
+            "y" -> do
+              e' <- Z.set z (path opts) (Just $ content') (Just $ Z.statVersion stat)
+              case e' of
+                Right _ -> do
+                  hPutStrLn stdout $ "updated."
+                Left _ -> 
+                  hPutStrLn stdout $ "failed to update. (" ++ p ++ ")"
+            _ -> return ()
+        else hPutStrLn stdout $ "nothing to update."
+    Left Z.NoNodeError -> return ()
+    Left zkerr -> hPutStrLn stderr $ show zkerr
 
 exec c opts@Stat {} = do
   putStrLn $ "stat"

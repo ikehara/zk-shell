@@ -27,4 +27,7 @@ executable zksh
                      , hzk
                      , haskeline
                      , cmdargs
+                     , temporary
+                     , directory
+                     , process
   ghc-options:         -threaded -Wall -rtsopts
