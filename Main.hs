@@ -6,6 +6,7 @@ module Main where
 
 -- import Control.Exception
 import Data.Maybe
+import Data.List (intercalate, isPrefixOf)
 import Data.List.Split
 import Control.Concurrent.STM
 import System.Console.Haskeline
@@ -131,6 +132,42 @@ _PROGRAM_INFO = _PROGRAM_NAME ++ " version " ++ _PROGRAM_VERSION
 _PROGRAM_ABOUT = "a shell for zookeeper"
 _COPYRIGHT = "(C) Kiyoshi IKEHARA 2014"
 
+mySettings :: Z.Zookeeper -> Settings IO
+mySettings z = Settings { historyFile = Just ".zksh_history"
+                        , complete = completeWord Nothing " \t" $ \str -> do
+                            wordList <- getWordList str
+                            return (searchFunc wordList str)
+                        , autoAddHistory = True
+                        }
+  where
+    searchFunc :: [(String, Z.Stat)] -> String -> [Completion]
+    searchFunc wordList str = flip map (filter (isPrefixOf str . fst) wordList) $ \(w, stat) -> Completion {
+        replacement = w
+      , display = (head $ reverse $ splitOn "/" w) ++ if Z.statNumChildren stat > 0 then "*" else ""
+      , isFinished = False
+      }
+
+    getWordList :: String -> IO ([(String, Z.Stat)])
+    getWordList str = do
+      let rev = reverse str
+          p = case dropWhile (/= '/') rev of
+                '/':[] -> "/"
+                '/':rest -> reverse rest
+                _ -> reverse rev
+      e <- Z.getChildren z p Nothing
+      case e of
+        Right nodes -> do
+          -- hPutStrLn stderr $ " (" ++ show p ++ ", " ++ (show $ map (concatPath p) nodes) ++ ")"
+          mWords <- forM (map (concatPath p) nodes) $ \npath -> do
+            eStat <- Z.exists z npath Nothing
+            case eStat of
+              Right stat -> return $ Just (npath, stat)
+              Left zkerr -> return $ Nothing
+          return (catMaybes mWords)
+        Left zkerr -> do
+          -- hPutStrLn stderr $ show zkerr ++ " (" ++ p ++ ")"
+          return []
+
 main :: IO ()
 main = do
   args <- getArgs
@@ -139,7 +176,7 @@ main = do
   Z.withZookeeper "localhost:2181" 1000 (Just $ watcher zsVar) Nothing $ \z -> do
     aclsVar <- newTVarIO Z.OpenAclUnsafe
     let context = Shell z aclsVar
-    if null args then runInputT defaultSettings (shell context zsVar) else do
+    if null args then runInputT (mySettings z) (shell context zsVar) else do
       opts <- cmdArgsRun commandModes
       optionHandler context opts
 
@@ -152,9 +189,11 @@ shell context zsVar = loop
       case minput of
         Nothing -> return ()
         Just "quit" -> return ()
-        Just input -> do
-          (liftIO $ execute context $ filter (not .null) $ splitOn " " input) `catch` (\(e :: SomeException) -> return ())
-          loop
+        Just input -> case filter (not . null) $ splitOn " " input of
+          [] -> loop
+          args -> do
+            liftIO (execute context args) `catch` (\(e :: SomeException) -> return ())
+            loop
 
 watcher zsVar z e s _ = case e of
   Z.SessionEvent -> atomically $ writeTVar zsVar s
